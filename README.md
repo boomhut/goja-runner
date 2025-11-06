@@ -1,5 +1,7 @@
 # goja-runner
 
+[![GoDoc](https://godoc.org/github.com/boomhut/goja-runner?status.svg)](https://godoc.org/github.com/boomhut/goja-runner) [![Go Report Card](https://goreportcard.com/badge/github.com/boomhut/goja-runner)](https://goreportcard.com/report/github.com/boomhut/goja-runner)
+
 A reusable Go package for executing JavaScript code using the [goja](https://github.com/dop251/goja) runtime.
 
 ## Features
