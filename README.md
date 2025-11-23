@@ -145,12 +145,91 @@ for i := 0; i < 1000; i++ {
 
 This avoids reloading and re-parsing the JavaScript code on each execution.
 
+### Concurrency
+
+`Runner` is not safe for concurrent use. The underlying goja runtime must only be accessed by one goroutine at a time. If you need parallel execution, create a separate `Runner` per goroutine or worker and load your scripts into each instance.
+
+#### Sharing State Across Runners
+
+To share state between multiple runners (e.g., in concurrent goroutines), use `NewWithGlobals` and pass pointers to shared Go objects. Ensure proper synchronization with `sync.Mutex`, channels, or atomics to avoid data races.
+
+```go
+import (
+    "fmt"
+    "sync"
+    "github.com/boomhut/goja-runner"
+)
+
+type SharedCounter struct {
+    mu    sync.Mutex
+    count int
+}
+
+func (sc *SharedCounter) Increment() int {
+    sc.mu.Lock()
+    defer sc.mu.Unlock()
+    sc.count++
+    return sc.count
+}
+
+func (sc *SharedCounter) GetCount() int {
+    sc.mu.Lock()
+    defer sc.mu.Unlock()
+    return sc.count
+}
+
+func main() {
+    counter := &SharedCounter{count: 0}
+    
+    // Create callable functions that JS can invoke
+    globals := map[string]interface{}{
+        "increment": counter.Increment,
+        "getCount":  counter.GetCount,
+    }
+    
+    var wg sync.WaitGroup
+    wg.Add(3)
+    
+    // Launch 3 concurrent workers
+    for i := 0; i < 3; i++ {
+        go func(id int) {
+            defer wg.Done()
+            
+            // Each goroutine gets its own runner
+            runner := jsrunner.NewWithGlobals(globals)
+            runner.LoadScriptString(`
+                function work() {
+                    return increment();
+                }
+            `)
+            
+            // Each worker increments 100 times
+            for j := 0; j < 100; j++ {
+                runner.Call("work")
+            }
+        }(i)
+    }
+    
+    wg.Wait()
+    
+    // All goroutines safely modified the shared counter
+    runner := jsrunner.NewWithGlobals(globals)
+    result, _ := runner.Eval("getCount()")
+    fmt.Println(jsrunner.ExportInt(result)) // Output: 300
+}
+```
+
+Note: JavaScript variables themselves are not shared—only the underlying Go objects they reference. Each runner maintains its own JavaScript environment, but all runners can call the same Go functions which safely modify shared state.
+
 ## API Reference
 
 ### Runner
 
 #### `New() *Runner`
 Creates a new JavaScript runner with a fresh runtime environment.
+
+#### `NewWithGlobals(globals map[string]interface{}) *Runner`
+Creates a new JavaScript runner with the provided global variables pre-set. Useful for sharing state across multiple runner instances.
 
 #### `SetGlobal(name string, value interface{})`
 Sets a global variable in the JavaScript environment.

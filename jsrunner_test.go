@@ -3,6 +3,7 @@ package jsrunner
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -690,5 +691,350 @@ func TestComplexScenario(t *testing.T) {
 	}
 	if ExportInt(result) != 3 {
 		t.Errorf("Expected count to be 3, got %d", ExportInt(result))
+	}
+}
+
+func TestNewWithGlobals(t *testing.T) {
+	globals := map[string]interface{}{
+		"apiKey":  "secret-123",
+		"timeout": 30,
+		"debug":   true,
+	}
+
+	runner := NewWithGlobals(globals)
+	if runner == nil {
+		t.Fatal("NewWithGlobals() returned nil")
+	}
+
+	// Verify globals are set
+	result, err := runner.Eval("apiKey")
+	if err != nil {
+		t.Fatalf("Eval() failed: %v", err)
+	}
+	if ExportString(result) != "secret-123" {
+		t.Errorf("Expected 'secret-123', got '%s'", ExportString(result))
+	}
+
+	result, err = runner.Eval("timeout")
+	if err != nil {
+		t.Fatalf("Eval() failed: %v", err)
+	}
+	if ExportInt(result) != 30 {
+		t.Errorf("Expected 30, got %d", ExportInt(result))
+	}
+
+	result, err = runner.Eval("debug")
+	if err != nil {
+		t.Fatalf("Eval() failed: %v", err)
+	}
+	if !ExportBool(result) {
+		t.Error("Expected true, got false")
+	}
+}
+
+func TestNewWithGlobalsEmptyMap(t *testing.T) {
+	runner := NewWithGlobals(map[string]interface{}{})
+	if runner == nil {
+		t.Fatal("NewWithGlobals() returned nil")
+	}
+	if runner.vm == nil {
+		t.Error("vm is nil")
+	}
+}
+
+func TestSharedStatePointer(t *testing.T) {
+	type SharedState struct {
+		Counter int
+		Data    string
+	}
+
+	state := &SharedState{
+		Counter: 0,
+		Data:    "initial",
+	}
+
+	globals := map[string]interface{}{
+		"state": state,
+	}
+
+	// Create two runners with shared state
+	runner1 := NewWithGlobals(globals)
+	runner2 := NewWithGlobals(globals)
+
+	// Modify state through Go
+	state.Counter = 42
+	state.Data = "modified"
+
+	// Both runners should see the updated state
+	result, err := runner1.Eval("state.Counter")
+	if err != nil {
+		t.Fatalf("runner1 Eval() failed: %v", err)
+	}
+	if ExportInt(result) != 42 {
+		t.Errorf("runner1: Expected 42, got %d", ExportInt(result))
+	}
+
+	result, err = runner2.Eval("state.Counter")
+	if err != nil {
+		t.Fatalf("runner2 Eval() failed: %v", err)
+	}
+	if ExportInt(result) != 42 {
+		t.Errorf("runner2: Expected 42, got %d", ExportInt(result))
+	}
+
+	result, err = runner1.Eval("state.Data")
+	if err != nil {
+		t.Fatalf("runner1 Eval() failed: %v", err)
+	}
+	if ExportString(result) != "modified" {
+		t.Errorf("runner1: Expected 'modified', got '%s'", ExportString(result))
+	}
+
+	result, err = runner2.Eval("state.Data")
+	if err != nil {
+		t.Fatalf("runner2 Eval() failed: %v", err)
+	}
+	if ExportString(result) != "modified" {
+		t.Errorf("runner2: Expected 'modified', got '%s'", ExportString(result))
+	}
+}
+
+func TestConcurrentRunners(t *testing.T) {
+	type SharedState struct {
+		Value int
+	}
+
+	state := &SharedState{Value: 100}
+	globals := map[string]interface{}{
+		"state": state,
+	}
+
+	// Test that multiple runners can be used concurrently
+	// Each runner is only accessed by one goroutine
+	done := make(chan bool, 2)
+
+	go func() {
+		runner := NewWithGlobals(globals)
+		err := runner.LoadScriptString(`
+			function getValue() {
+				return state.Value;
+			}
+		`)
+		if err != nil {
+			t.Errorf("goroutine 1: LoadScriptString() failed: %v", err)
+		}
+
+		for i := 0; i < 100; i++ {
+			result, err := runner.Call("getValue")
+			if err != nil {
+				t.Errorf("goroutine 1: Call() failed: %v", err)
+				break
+			}
+			if ExportInt(result) != 100 {
+				t.Errorf("goroutine 1: Expected 100, got %d", ExportInt(result))
+				break
+			}
+		}
+		done <- true
+	}()
+
+	go func() {
+		runner := NewWithGlobals(globals)
+		err := runner.LoadScriptString(`
+			function calculate() {
+				return state.Value * 2;
+			}
+		`)
+		if err != nil {
+			t.Errorf("goroutine 2: LoadScriptString() failed: %v", err)
+		}
+
+		for i := 0; i < 100; i++ {
+			result, err := runner.Call("calculate")
+			if err != nil {
+				t.Errorf("goroutine 2: Call() failed: %v", err)
+				break
+			}
+			if ExportInt(result) != 200 {
+				t.Errorf("goroutine 2: Expected 200, got %d", ExportInt(result))
+				break
+			}
+		}
+		done <- true
+	}()
+
+	<-done
+	<-done
+}
+
+func TestConcurrentRunnersIndependentScripts(t *testing.T) {
+	// Test that runners in different goroutines maintain independent JS environments
+	done := make(chan bool, 2)
+
+	go func() {
+		runner := New()
+		err := runner.LoadScriptString(`var x = 1;`)
+		if err != nil {
+			t.Errorf("goroutine 1: LoadScriptString() failed: %v", err)
+		}
+
+		for i := 0; i < 50; i++ {
+			runner.LoadScriptString(`x = x + 1;`)
+		}
+
+		result, err := runner.Eval("x")
+		if err != nil {
+			t.Errorf("goroutine 1: Eval() failed: %v", err)
+		}
+		if ExportInt(result) != 51 {
+			t.Errorf("goroutine 1: Expected 51, got %d", ExportInt(result))
+		}
+		done <- true
+	}()
+
+	go func() {
+		runner := New()
+		err := runner.LoadScriptString(`var x = 100;`)
+		if err != nil {
+			t.Errorf("goroutine 2: LoadScriptString() failed: %v", err)
+		}
+
+		for i := 0; i < 50; i++ {
+			runner.LoadScriptString(`x = x - 1;`)
+		}
+
+		result, err := runner.Eval("x")
+		if err != nil {
+			t.Errorf("goroutine 2: Eval() failed: %v", err)
+		}
+		if ExportInt(result) != 50 {
+			t.Errorf("goroutine 2: Expected 50, got %d", ExportInt(result))
+		}
+		done <- true
+	}()
+
+	<-done
+	<-done
+}
+
+func TestSharedGlobalsIsolatedJSEnvironments(t *testing.T) {
+	// Test that while Go state is shared, JS environments remain isolated
+	globals := map[string]interface{}{
+		"apiKey": "shared-key",
+	}
+
+	runner1 := NewWithGlobals(globals)
+	runner2 := NewWithGlobals(globals)
+
+	// Define a JS variable in runner1
+	err := runner1.LoadScriptString(`var localVar = "runner1";`)
+	if err != nil {
+		t.Fatalf("runner1 LoadScriptString() failed: %v", err)
+	}
+
+	// Define a JS variable in runner2
+	err = runner2.LoadScriptString(`var localVar = "runner2";`)
+	if err != nil {
+		t.Fatalf("runner2 LoadScriptString() failed: %v", err)
+	}
+
+	// Verify both can access shared global
+	result, err := runner1.Eval("apiKey")
+	if err != nil {
+		t.Fatalf("runner1 Eval(apiKey) failed: %v", err)
+	}
+	if ExportString(result) != "shared-key" {
+		t.Errorf("runner1: Expected 'shared-key', got '%s'", ExportString(result))
+	}
+
+	result, err = runner2.Eval("apiKey")
+	if err != nil {
+		t.Fatalf("runner2 Eval(apiKey) failed: %v", err)
+	}
+	if ExportString(result) != "shared-key" {
+		t.Errorf("runner2: Expected 'shared-key', got '%s'", ExportString(result))
+	}
+
+	// Verify JS environments are isolated
+	result, err = runner1.Eval("localVar")
+	if err != nil {
+		t.Fatalf("runner1 Eval(localVar) failed: %v", err)
+	}
+	if ExportString(result) != "runner1" {
+		t.Errorf("runner1: Expected 'runner1', got '%s'", ExportString(result))
+	}
+
+	result, err = runner2.Eval("localVar")
+	if err != nil {
+		t.Fatalf("runner2 Eval(localVar) failed: %v", err)
+	}
+	if ExportString(result) != "runner2" {
+		t.Errorf("runner2: Expected 'runner2', got '%s'", ExportString(result))
+	}
+}
+
+func TestConcurrentMutationsWithSync(t *testing.T) {
+	// Test that shared mutable state works correctly across goroutines with proper synchronization
+	type Counter struct {
+		mu    sync.Mutex
+		value int
+	}
+
+	counter := &Counter{value: 0}
+
+	// Create methods that JS can call
+	increment := func() int {
+		counter.mu.Lock()
+		defer counter.mu.Unlock()
+		counter.value++
+		return counter.value
+	}
+
+	getValue := func() int {
+		counter.mu.Lock()
+		defer counter.mu.Unlock()
+		return counter.value
+	}
+
+	globals := map[string]interface{}{
+		"increment": increment,
+		"getValue":  getValue,
+	}
+
+	const numGoroutines = 10
+	const incrementsPerGoroutine = 100
+	done := make(chan bool, numGoroutines)
+
+	// Launch multiple goroutines that increment the counter
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			runner := NewWithGlobals(globals)
+			for j := 0; j < incrementsPerGoroutine; j++ {
+				_, err := runner.Eval("increment()")
+				if err != nil {
+					t.Errorf("increment() failed: %v", err)
+					break
+				}
+			}
+			done <- true
+		}()
+	}
+
+	// Wait for all goroutines to complete
+	for i := 0; i < numGoroutines; i++ {
+		<-done
+	}
+
+	// Verify the final count
+	runner := NewWithGlobals(globals)
+	result, err := runner.Eval("getValue()")
+	if err != nil {
+		t.Fatalf("getValue() failed: %v", err)
+	}
+
+	expected := int64(numGoroutines * incrementsPerGoroutine)
+	actual := ExportInt(result)
+	if actual != expected {
+		t.Errorf("Expected counter to be %d, got %d", expected, actual)
 	}
 }

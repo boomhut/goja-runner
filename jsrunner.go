@@ -67,6 +67,42 @@ func New() *Runner {
 	}
 }
 
+// NewWithGlobals creates a new JavaScript runner with the provided global variables.
+// This is useful for creating multiple runner instances that share the same global state,
+// which is particularly helpful when working with concurrent goroutines.
+//
+// To share mutable state between runners in different goroutines, pass pointers to
+// Go objects (e.g., structs, sync.Mutex, channels) and ensure proper synchronization
+// to avoid data races.
+//
+// Example:
+//
+//	type SharedState struct {
+//	    mu      sync.Mutex
+//	    counter int
+//	}
+//
+//	state := &SharedState{}
+//	globals := map[string]interface{}{
+//	    "apiKey": "secret-123",
+//	    "state":  state,
+//	}
+//
+//	// Create multiple runners with shared globals
+//	runner1 := jsrunner.NewWithGlobals(globals)
+//	runner2 := jsrunner.NewWithGlobals(globals)
+//
+// Note: While the Go-side values are shared, each runner maintains its own
+// JavaScript environment. Changes to JavaScript variables in one runner do not
+// affect other runners.
+func NewWithGlobals(globals map[string]interface{}) *Runner {
+	r := New()
+	for k, v := range globals {
+		r.SetGlobal(k, v)
+	}
+	return r
+}
+
 // SetGlobal sets a global variable in the JavaScript environment with the specified name and value.
 // The value is stored both in the internal globals map and directly in the JavaScript VM,
 // making it accessible to all subsequently executed JavaScript code.
