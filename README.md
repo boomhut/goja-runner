@@ -221,6 +221,113 @@ func main() {
 
 Note: JavaScript variables themselves are not shared—only the underlying Go objects they reference. Each runner maintains its own JavaScript environment, but all runners can call the same Go functions which safely modify shared state.
 
+### Example: React SSR with Fiber
+
+You can use goja-runner to server-side render a React application and return the markup through a [Fiber](https://github.com/gofiber/fiber) handler.
+
+1. Download the UMD builds of `react` and `react-dom/server` (e.g., from the official CDN) into `./assets/react.development.js` and `./assets/react-dom-server.development.js`.
+2. Bundle your application-specific SSR entry (e.g., with Vite/Rollup) into `./assets/app.ssr.js` and expose a global `renderApp(props)` function that returns `ReactDOMServer.renderToString(<App {...props} />)`.
+3. Optionally ship a browser bundle at `./assets/public/client.bundle.js` that hydrates `window.__INITIAL_PROPS__`.
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "log"
+    "sync"
+    "time"
+
+    "github.com/gofiber/fiber/v2"
+    jsrunner "github.com/boomhut/goja-runner"
+)
+
+type ReactRenderer struct {
+    mu     sync.Mutex
+    runner *jsrunner.Runner
+}
+
+func NewReactRenderer() (*ReactRenderer, error) {
+    r := jsrunner.New()
+
+    loaders := []struct {
+        name string
+        fn   func() error
+    }{
+        {"react", func() error { return r.LoadScript("./assets/react.development.js") }},
+        {"react-dom-server", func() error { return r.LoadScript("./assets/react-dom-server.development.js") }},
+        {"app", func() error { return r.LoadScript("./assets/app.ssr.js") }},
+    }
+
+    for _, loader := range loaders {
+        if err := loader.fn(); err != nil {
+            return nil, fmt.Errorf("failed to load %s: %w", loader.name, err)
+        }
+    }
+
+    return &ReactRenderer{runner: r}, nil
+}
+
+func (rr *ReactRenderer) Render(props map[string]interface{}) (string, error) {
+    rr.mu.Lock()
+    defer rr.mu.Unlock()
+
+    rr.runner.SetGlobal("SERVER_PROPS", props)
+    result, err := rr.runner.Eval("renderApp(SERVER_PROPS)")
+    if err != nil {
+        return "", err
+    }
+    return jsrunner.ExportString(result), nil
+}
+
+func mustJSON(v interface{}) string {
+    b, _ := json.Marshal(v)
+    return string(b)
+}
+
+func main() {
+    renderer, err := NewReactRenderer()
+    if err != nil {
+        log.Fatalf("boot renderer: %v", err)
+    }
+
+    app := fiber.New()
+    app.Get("/", func(c *fiber.Ctx) error {
+        props := map[string]interface{}{
+            "user":      "Fiber",
+            "timestamp": time.Now().Format(time.RFC3339),
+            "message":   "Hello from goja-runner + React",
+        }
+
+        markup, err := renderer.Render(props)
+        if err != nil {
+            return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+        }
+
+        html := fmt.Sprintf(`<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>React + goja-runner</title>
+  </head>
+  <body>
+    <div id="root">%s</div>
+    <script>window.__INITIAL_PROPS__ = %s;</script>
+    <script src="/static/client.bundle.js"></script>
+  </body>
+</html>`, markup, mustJSON(props))
+
+        return c.Type("html").SendString(html)
+    })
+
+    app.Static("/static", "./assets/public")
+    log.Fatal(app.Listen(":3000"))
+}
+```
+
+The renderer uses a mutex to serialize access to the shared goja runtime (Fiber may serve multiple requests concurrently). Each handler injects fresh props, calls the React SSR entry, and returns fully formed HTML plus initial data for hydration on the client.
+
 ## API Reference
 
 ### Runner
