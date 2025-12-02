@@ -221,112 +221,156 @@ func main() {
 
 Note: JavaScript variables themselves are not shared—only the underlying Go objects they reference. Each runner maintains its own JavaScript environment, but all runners can call the same Go functions which safely modify shared state.
 
-### Example: React SSR with Fiber
+### Web Access Helpers
 
-You can use goja-runner to server-side render a React application and return the markup through a [Fiber](https://github.com/gofiber/fiber) handler.
-
-1. Download the UMD builds of `react` and `react-dom/server` (e.g., from the official CDN) into `./assets/react.development.js` and `./assets/react-dom-server.development.js`.
-2. Bundle your application-specific SSR entry (e.g., with Vite/Rollup) into `./assets/app.ssr.js` and expose a global `renderApp(props)` function that returns `ReactDOMServer.renderToString(<App {...props} />)`.
-3. Optionally ship a browser bundle at `./assets/public/client.bundle.js` that hydrates `window.__INITIAL_PROPS__`.
+`jsrunner.WithWebAccess` enables built-in fetch helpers so JavaScript can synchronously pull remote resources. Pass an optional `WebAccessConfig` to tweak the timeout or supply a custom `http.Client`.
 
 ```go
-package main
-
 import (
-    "encoding/json"
     "fmt"
-    "log"
-    "sync"
     "time"
 
-    "github.com/gofiber/fiber/v2"
     jsrunner "github.com/boomhut/goja-runner"
 )
 
-type ReactRenderer struct {
-    mu     sync.Mutex
-    runner *jsrunner.Runner
-}
+runner := jsrunner.New(jsrunner.WithWebAccess(&jsrunner.WebAccessConfig{
+    Timeout: 5 * time.Second,
+}))
 
-func NewReactRenderer() (*ReactRenderer, error) {
-    r := jsrunner.New()
+txtResult, _ := runner.Call("fetchText", "https://httpbin.org/get")
+fmt.Println(jsrunner.ExportString(txtResult))
 
-    loaders := []struct {
-        name string
-        fn   func() error
-    }{
-        {"react", func() error { return r.LoadScript("./assets/react.development.js") }},
-        {"react-dom-server", func() error { return r.LoadScript("./assets/react-dom-server.development.js") }},
-        {"app", func() error { return r.LoadScript("./assets/app.ssr.js") }},
-    }
+jsonResult, _ := runner.Call("fetchJSON", "https://httpbin.org/json")
+fmt.Printf("got %#v\n", jsrunner.Export(jsonResult))
+```
 
-    for _, loader := range loaders {
-        if err := loader.fn(); err != nil {
-            return nil, fmt.Errorf("failed to load %s: %w", loader.name, err)
-        }
-    }
+`fetchText` returns the response body as a string while `fetchJSON` unmarshals JSON into Go values. Because the helpers run inside Go, you retain control over headers, retries, and timeouts even when the script requests external endpoints.
 
-    return &ReactRenderer{runner: r}, nil
-}
+### ReactApp Helper (SSR + Hydration)
 
-func (rr *ReactRenderer) Render(props map[string]interface{}) (string, error) {
-    rr.mu.Lock()
-    defer rr.mu.Unlock()
+`ReactApp` bundles a React server entry and matching client entry with [esbuild](https://pkg.go.dev/github.com/evanw/esbuild/pkg/api), injects any required polyfills, and exposes helpers for rendering props on the server and serving the browser bundle.
 
-    rr.runner.SetGlobal("SERVER_PROPS", props)
-    result, err := rr.runner.Eval("renderApp(SERVER_PROPS)")
-    if err != nil {
-        return "", err
-    }
-    return jsrunner.ExportString(result), nil
-}
+```go
+renderer, err := jsrunner.NewReactApp(jsrunner.ReactAppOptions{
+    RunnerOptions: []jsrunner.Option{
+        jsrunner.WithWebAccess(&jsrunner.WebAccessConfig{Timeout: 5 * time.Second}),
+    },
+    Polyfills:   []string{string(polyfillsJS)},
+    SSREntry:    serverSource,  // must export renderApp(props)
+    ClientEntry: clientSource,  // boots hydrateRoot() (or similar)
+})
 
-func mustJSON(v interface{}) string {
-    b, _ := json.Marshal(v)
-    return string(b)
-}
+markup, _ := renderer.Render(map[string]interface{}{"message": "hi"})
+bundle := renderer.ClientBundle()
+```
 
+`ReactApp` compiles both entries in-memory, so you do not need Node.js or a separate build step. Provide your own source strings or load them from disk/templates.
+
+### Example: React SSR with Fiber
+
+The [`examples/fiber-react`](examples/fiber-react) sample wires `ReactApp` into a Fiber server. On boot, `ReactApp` downloads `react`, `react-dom/server`, and `react-dom/client` from [esm.sh](https://esm.sh), bundles the provided server/client entries, and exposes helpers to render HTML and serve the browser bundle.
+
+Steps:
+
+1. Ensure the machine can reach `https://esm.sh` (the first run caches the React bundles locally in memory).
+2. Run `go run ./examples/fiber-react`.
+3. Visit `http://localhost:3000` to see the SSR output and client hydration.
+
+Key parts of the example:
+
+```go
 func main() {
-    renderer, err := NewReactRenderer()
+    renderer, err := jsrunner.NewReactApp(jsrunner.ReactAppOptions{
+        RunnerOptions: []jsrunner.Option{
+            jsrunner.WithWebAccess(&jsrunner.WebAccessConfig{Timeout: 5 * time.Second}),
+        },
+        Polyfills:   []string{string(polyfills)},
+        SSREntry:    defaultSSREntry,
+        ClientEntry: defaultClientEntry,
+    })
     if err != nil {
         log.Fatalf("boot renderer: %v", err)
     }
 
     app := fiber.New()
-    app.Get("/", func(c *fiber.Ctx) error {
-        props := map[string]interface{}{
-            "user":      "Fiber",
-            "timestamp": time.Now().Format(time.RFC3339),
-            "message":   "Hello from goja-runner + React",
-        }
+        app.Get("/", func(c *fiber.Ctx) error {
+                props := map[string]interface{}{
+                        "user":      "Fiber",
+                        "timestamp": time.Now().Format(time.RFC3339),
+                        "message":   "Hello from goja-runner + React",
+                }
 
-        markup, err := renderer.Render(props)
-        if err != nil {
-            return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-        }
+                markup, err := renderer.Render(props)
+                if err != nil {
+                        return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+                }
 
-        html := fmt.Sprintf(`<!doctype html>
+                html := fmt.Sprintf(`<!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8" />
-    <title>React + goja-runner</title>
-  </head>
-  <body>
-    <div id="root">%s</div>
-    <script>window.__INITIAL_PROPS__ = %s;</script>
-    <script src="/static/client.bundle.js"></script>
-  </body>
+    <head>
+        <meta charset="utf-8" />
+        <title>goja-runner + React SSR</title>
+    </head>
+    <body>
+        <div id="root">%s</div>
+        <script>window.__INITIAL_PROPS__ = %s;</script>
+        <script src="/static/client.bundle.js"></script>
+    </body>
 </html>`, markup, mustJSON(props))
 
-        return c.Type("html").SendString(html)
-    })
+                return c.Type("html").SendString(html)
+        })
 
-    app.Static("/static", "./assets/public")
+        app.Get("/static/client.bundle.js", func(c *fiber.Ctx) error {
+                c.Type("js")
+                return c.SendString(renderer.ClientBundle())
+        })
+
+    log.Println("listening on http://localhost:3000")
     log.Fatal(app.Listen(":3000"))
 }
 ```
 
-The renderer uses a mutex to serialize access to the shared goja runtime (Fiber may serve multiple requests concurrently). Each handler injects fresh props, calls the React SSR entry, and returns fully formed HTML plus initial data for hydration on the client.
+When the process boots it runs esbuild twice—once targeting the server runtime (to create an IIFE that populates `globalThis.renderApp`) and once for the browser bundle (hydration). Because everything stays inside Go, the example remains self-contained while still benefiting from a proper React/JSX toolchain. `ReactApp` handles the bundling glue so your application code only needs to provide the two entry strings and wire the results into your HTTP framework of choice.
+
+### Exposing Network Helpers to JavaScript
+
+Workers cannot perform HTTP requests directly inside goja, but you can expose Go helpers that wrap `net/http` (or any other client) and make them available via `SetGlobal`. The Fiber+React example registers a `fetchJSON(url string) (map[string]interface{}, error)` helper so scripts can pull data from external APIs before rendering:
+
+```go
+httpClient := &http.Client{Timeout: 5 * time.Second}
+
+fetchJSON := func(url string) (map[string]interface{}, error) {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    resp, err := httpClient.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode >= 400 {
+        return nil, fmt.Errorf("fetchJSON got status %d", resp.StatusCode)
+    }
+
+    var payload map[string]interface{}
+    if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+        return nil, err
+    }
+
+    return payload, nil
+}
+
+runner.SetGlobal("fetchJSON", fetchJSON)
+```
+
+In JavaScript you can now call `const post = fetchJSON("https://jsonplaceholder.typicode.com/posts/1");` and render it synchronously. By keeping networking logic in Go you retain full control over timeouts, retries, and authentication, while scripts get a simple API.
 
 ## API Reference
 

@@ -1,10 +1,13 @@
 package jsrunner
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNew(t *testing.T) {
@@ -1036,5 +1039,68 @@ func TestConcurrentMutationsWithSync(t *testing.T) {
 	actual := ExportInt(result)
 	if actual != expected {
 		t.Errorf("Expected counter to be %d, got %d", expected, actual)
+	}
+}
+
+func TestWithWebAccessFetchHelpers(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/text":
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("hello world"))
+		case "/json":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok","value":42}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	runner := New(WithWebAccess(&WebAccessConfig{Timeout: time.Second}))
+
+	textResult, err := runner.Call("fetchText", srv.URL+"/text")
+	if err != nil {
+		t.Fatalf("fetchText failed: %v", err)
+	}
+	if got := ExportString(textResult); got != "hello world" {
+		t.Errorf("Expected 'hello world', got '%s'", got)
+	}
+
+	jsonResult, err := runner.Call("fetchJSON", srv.URL+"/json")
+	if err != nil {
+		t.Fatalf("fetchJSON failed: %v", err)
+	}
+	data, ok := Export(jsonResult).(map[string]interface{})
+	if !ok {
+		t.Fatalf("Expected map from fetchJSON, got %T", Export(jsonResult))
+	}
+	if data["status"] != "ok" {
+		t.Errorf("Expected status 'ok', got %v", data["status"])
+	}
+
+	if _, err := runner.Call("fetchText", srv.URL+"/missing"); err == nil {
+		t.Fatal("expected fetchText on missing route to error")
+	}
+}
+
+func TestEnableWebAccessAfterInit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("late"))
+	}))
+	defer srv.Close()
+
+	customClient := &http.Client{Timeout: 200 * time.Millisecond}
+	runner := New()
+	runner.EnableWebAccess(&WebAccessConfig{Client: customClient, Timeout: 200 * time.Millisecond})
+
+	textResult, err := runner.Call("fetchText", srv.URL)
+	if err != nil {
+		t.Fatalf("fetchText after EnableWebAccess failed: %v", err)
+	}
+	if ExportString(textResult) != "late" {
+		t.Errorf("Expected 'late', got '%s'", ExportString(textResult))
 	}
 }

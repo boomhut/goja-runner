@@ -4,6 +4,7 @@ go 1.25.3
 
 require (
 	github.com/dop251/goja v0.0.0-20251103141225-af2ceb9156d7
+	github.com/evanw/esbuild v0.27.0
 	github.com/gofiber/fiber/v2 v2.52.10
 )
 

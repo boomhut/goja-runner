@@ -26,8 +26,13 @@
 package jsrunner
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/dop251/goja"
 )
@@ -45,8 +50,69 @@ import (
 //	runner.LoadScript("script.js")
 //	result, err := runner.Call("processData", input)
 type Runner struct {
-	vm      *goja.Runtime
-	globals map[string]interface{}
+	vm               *goja.Runtime
+	globals          map[string]interface{}
+	httpClient       *http.Client
+	webAccessEnabled bool
+	webAccessTimeout time.Duration
+}
+
+const defaultWebAccessTimeout = 10 * time.Second
+
+// Option configures Runner behavior during construction.
+type Option func(*Runner)
+
+// WebAccessConfig controls the built-in fetch helpers exposed to JavaScript.
+type WebAccessConfig struct {
+	Client  *http.Client
+	Timeout time.Duration
+}
+
+// WithWebAccess enables the built-in fetch helpers (`fetchJSON`, `fetchText`).
+// Provide a custom HTTP client or timeout via WebAccessConfig; when nil, sensible defaults are used.
+func WithWebAccess(cfg *WebAccessConfig) Option {
+	return func(r *Runner) {
+		r.webAccessEnabled = true
+		if cfg == nil {
+			return
+		}
+		if cfg.Client != nil {
+			r.httpClient = cfg.Client
+		}
+		if cfg.Timeout > 0 {
+			r.webAccessTimeout = cfg.Timeout
+		}
+	}
+}
+
+func (r *Runner) applyOptions(opts ...Option) {
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(r)
+	}
+
+	if r.webAccessEnabled {
+		r.initWebAccess()
+	}
+}
+
+// EnableWebAccess turns on the built-in fetch helpers after runner construction.
+func (r *Runner) EnableWebAccess(cfg *WebAccessConfig) {
+	WithWebAccess(cfg)(r)
+	r.webAccessEnabled = true
+	r.initWebAccess()
+}
+
+func (r *Runner) initWebAccess() {
+	if r.webAccessTimeout <= 0 {
+		r.webAccessTimeout = defaultWebAccessTimeout
+	}
+	if r.httpClient == nil {
+		r.httpClient = &http.Client{Timeout: r.webAccessTimeout}
+	}
+	r.installFetchGlobals()
 }
 
 // New creates and returns a new JavaScript runner with a fresh runtime environment.
@@ -60,11 +126,13 @@ type Runner struct {
 //
 //	runner := jsrunner.New()
 //	runner.LoadScriptString(`var x = 42;`)
-func New() *Runner {
-	return &Runner{
+func New(opts ...Option) *Runner {
+	runner := &Runner{
 		vm:      goja.New(),
 		globals: make(map[string]interface{}),
 	}
+	runner.applyOptions(opts...)
+	return runner
 }
 
 // NewWithGlobals creates a new JavaScript runner with the provided global variables.
@@ -95,8 +163,8 @@ func New() *Runner {
 // Note: While the Go-side values are shared, each runner maintains its own
 // JavaScript environment. Changes to JavaScript variables in one runner do not
 // affect other runners.
-func NewWithGlobals(globals map[string]interface{}) *Runner {
-	r := New()
+func NewWithGlobals(globals map[string]interface{}, opts ...Option) *Runner {
+	r := New(opts...)
 	for k, v := range globals {
 		r.SetGlobal(k, v)
 	}
@@ -309,6 +377,52 @@ func (r *Runner) Eval(expression string) (goja.Value, error) {
 // Use with caution and ensure you understand goja's API.
 func (r *Runner) GetVM() *goja.Runtime {
 	return r.vm
+}
+
+func (r *Runner) installFetchGlobals() {
+	r.SetGlobal("fetchText", func(url string) (string, error) {
+		data, err := r.fetchBytes(url)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	})
+
+	r.SetGlobal("fetchJSON", func(url string) (interface{}, error) {
+		data, err := r.fetchBytes(url)
+		if err != nil {
+			return nil, err
+		}
+
+		var payload interface{}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return nil, err
+		}
+
+		return payload, nil
+	})
+}
+
+func (r *Runner) fetchBytes(url string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), r.webAccessTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("fetch request failed with status %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
 }
 
 // ExportString is a helper function that converts a goja.Value to a Go string.
