@@ -293,45 +293,64 @@ func main() {
     }
 
     app := fiber.New()
-        app.Get("/", func(c *fiber.Ctx) error {
-                props := map[string]interface{}{
-                        "user":      "Fiber",
-                        "timestamp": time.Now().Format(time.RFC3339),
-                        "message":   "Hello from goja-runner + React",
-                }
 
-                markup, err := renderer.Render(props)
-                if err != nil {
-                        return fiber.NewError(fiber.StatusInternalServerError, err.Error())
-                }
+    app.Get("/", func(c *fiber.Ctx) error {
+        reqStart := time.Now()
+        props := map[string]interface{}{
+            "user":      "Fiber",
+            "timestamp": time.Now().Format(time.RFC3339),
+            "message":   "Hello from goja-runner + React",
+            "bundleMs":  millis(renderer.BundleDuration()),
+            "metrics":   renderer.MetricsSnapshot(),
+        }
 
-                html := fmt.Sprintf(`<!doctype html>
+        renderStart := time.Now()
+        markup, err := renderer.Render(props)
+        if err != nil {
+            return fiber.NewError(fiber.StatusInternalServerError, err.Error())
+        }
+
+        renderDuration := time.Since(renderStart)
+        requestDuration := time.Since(reqStart)
+        renderer.RecordMetrics(renderDuration, requestDuration)
+
+        html := fmt.Sprintf(`<!doctype html>
 <html>
-    <head>
-        <meta charset="utf-8" />
-        <title>goja-runner + React SSR</title>
-    </head>
-    <body>
-        <div id="root">%s</div>
-        <script>window.__INITIAL_PROPS__ = %s;</script>
-        <script src="/static/client.bundle.js"></script>
-    </body>
-</html>`, markup, mustJSON(props))
+  <head>
+    <meta charset="utf-8" />
+    <title>goja-runner + React SSR</title>
+    <style>%s</style>
+  </head>
+  <body>
+    <div id="root">%s</div>
+    <script>window.__INITIAL_PROPS__ = %s;</script>
+    <script src="/static/client.bundle.js"></script>
+  </body>
+</html>`, pageStyles, markup, mustJSON(props))
 
-                return c.Type("html").SendString(html)
-        })
+        c.Set("Server-Timing", fmt.Sprintf("render;dur=%.2f,request;dur=%.2f",
+            millis(renderDuration), millis(requestDuration)))
+        return c.Type("html").SendString(html)
+    })
 
-        app.Get("/static/client.bundle.js", func(c *fiber.Ctx) error {
-                c.Type("js")
-                return c.SendString(renderer.ClientBundle())
-        })
+    app.Get("/static/client.bundle.js", func(c *fiber.Ctx) error {
+        c.Type("js")
+        return c.SendString(renderer.ClientBundle())
+    })
+
+    app.Get("/metrics", func(c *fiber.Ctx) error {
+        c.Set("Cache-Control", "no-store, max-age=0")
+        return c.JSON(fiber.Map{"metrics": renderer.MetricsSnapshot()})
+    })
 
     log.Println("listening on http://localhost:3000")
     log.Fatal(app.Listen(":3000"))
 }
 ```
 
-When the process boots it runs esbuild twice—once targeting the server runtime (to create an IIFE that populates `globalThis.renderApp`) and once for the browser bundle (hydration). Because everything stays inside Go, the example remains self-contained while still benefiting from a proper React/JSX toolchain. `ReactApp` handles the bundling glue so your application code only needs to provide the two entry strings and wire the results into your HTTP framework of choice.
+`millis`/`pageStyles` in the example are small helpers that convert a `time.Duration` into milliseconds and embed the CSS used by the React components.
+
+When the process boots it runs esbuild twice—once targeting the server runtime (to create an IIFE that populates `globalThis.renderApp`) and once for the browser bundle (hydration). Because everything stays inside Go, the example remains self-contained while still benefiting from a proper React/JSX toolchain. The enhanced example also captures per-request render timings, emits `Server-Timing` headers, serves a `/metrics` JSON endpoint, and hydrates a React dashboard that can refresh those metrics with `fetch`. `ReactApp` handles the bundling glue so your application code only needs to provide the two entry strings and wire the results into your HTTP framework of choice.
 
 ### Exposing Network Helpers to JavaScript
 
