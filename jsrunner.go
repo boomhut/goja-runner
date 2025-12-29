@@ -32,9 +32,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/dop251/goja"
+	"github.com/dop251/goja_nodejs/eventloop"
 )
 
 // Runner represents a JavaScript runtime environment that can execute scripts.
@@ -569,4 +571,463 @@ func Export(val goja.Value) interface{} {
 		return nil
 	}
 	return val.Export()
+}
+
+// EventLoopRunner represents a JavaScript runtime with an event loop that supports
+// asynchronous operations like Promises, setTimeout, setInterval, and setImmediate.
+// It wraps the goja runtime with an event loop for proper async/await support.
+//
+// Unlike the basic Runner, EventLoopRunner can execute JavaScript code that uses:
+//   - Promises and async/await
+//   - setTimeout and clearTimeout
+//   - setInterval and clearInterval
+//   - setImmediate and clearImmediate
+//
+// The event loop runs in the background and processes callbacks until stopped.
+//
+// Example:
+//
+//	runner := jsrunner.NewEventLoopRunner()
+//	runner.Start()
+//	defer runner.Stop()
+//
+//	result, err := runner.RunAsync(`
+//	    async function fetchData() {
+//	        return new Promise(resolve => {
+//	            setTimeout(() => resolve("done"), 100);
+//	        });
+//	    }
+//	    fetchData();
+//	`)
+type EventLoopRunner struct {
+	loop             *eventloop.EventLoop
+	globals          map[string]interface{}
+	mu               sync.RWMutex
+	httpClient       *http.Client
+	webAccessEnabled bool
+	webAccessTimeout time.Duration
+}
+
+// NewEventLoopRunner creates a new JavaScript runner with an event loop.
+// The event loop provides support for asynchronous JavaScript operations including
+// Promises, setTimeout, setInterval, and setImmediate.
+//
+// The runner must be started with Start() before executing async code,
+// and should be stopped with Stop() when done.
+//
+// Example:
+//
+//	runner := jsrunner.NewEventLoopRunner()
+//	runner.Start()
+//	defer runner.Stop()
+//
+//	result, err := runner.RunAsync(`
+//	    new Promise(resolve => setTimeout(() => resolve(42), 100))
+//	`)
+func NewEventLoopRunner(opts ...Option) *EventLoopRunner {
+	r := &EventLoopRunner{
+		loop:    eventloop.NewEventLoop(),
+		globals: make(map[string]interface{}),
+	}
+	r.applyOptions(opts...)
+	return r
+}
+
+// NewEventLoopRunnerWithGlobals creates a new event loop runner with predefined global variables.
+// This is useful for sharing state between multiple async operations or providing
+// configuration to JavaScript code.
+//
+// Example:
+//
+//	globals := map[string]interface{}{
+//	    "apiUrl": "https://api.example.com",
+//	    "timeout": 5000,
+//	}
+//	runner := jsrunner.NewEventLoopRunnerWithGlobals(globals)
+//	runner.Start()
+//	defer runner.Stop()
+func NewEventLoopRunnerWithGlobals(globals map[string]interface{}, opts ...Option) *EventLoopRunner {
+	r := NewEventLoopRunner(opts...)
+	for k, v := range globals {
+		r.globals[k] = v
+	}
+	return r
+}
+
+func (r *EventLoopRunner) applyOptions(opts ...Option) {
+	// Create a temporary runner to apply options and extract config
+	tempRunner := &Runner{
+		globals: make(map[string]interface{}),
+	}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(tempRunner)
+	}
+
+	r.webAccessEnabled = tempRunner.webAccessEnabled
+	r.httpClient = tempRunner.httpClient
+	r.webAccessTimeout = tempRunner.webAccessTimeout
+}
+
+// Start starts the event loop in the background.
+// This must be called before using RunAsync, SetTimeout, or SetInterval.
+// The event loop will continue running until Stop() is called.
+//
+// Example:
+//
+//	runner := jsrunner.NewEventLoopRunner()
+//	runner.Start()
+//	defer runner.Stop()
+func (r *EventLoopRunner) Start() {
+	r.loop.Start()
+}
+
+// Stop stops the event loop and waits for all pending callbacks to complete.
+// After calling Stop(), the runner should not be used again.
+//
+// Example:
+//
+//	runner := jsrunner.NewEventLoopRunner()
+//	runner.Start()
+//	// ... do work ...
+//	runner.Stop()
+func (r *EventLoopRunner) Stop() {
+	r.loop.Stop()
+}
+
+// StopNoWait stops the event loop without waiting for pending callbacks.
+// Use this when you want to immediately terminate all pending operations.
+func (r *EventLoopRunner) StopNoWait() {
+	r.loop.StopNoWait()
+}
+
+// SetGlobal sets a global variable that will be available in all JavaScript executions.
+// This is thread-safe and can be called while the event loop is running.
+//
+// Example:
+//
+//	runner.SetGlobal("config", map[string]interface{}{
+//	    "debug": true,
+//	    "maxRetries": 3,
+//	})
+func (r *EventLoopRunner) SetGlobal(name string, value interface{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.globals[name] = value
+}
+
+// Run executes JavaScript code synchronously within the event loop.
+// This is useful for initialization code or synchronous operations.
+// The callback receives the goja.Runtime for direct manipulation.
+//
+// Example:
+//
+//	runner.Run(func(vm *goja.Runtime) {
+//	    vm.Set("myFunc", func(x int) int { return x * 2 })
+//	    vm.RunString("var result = myFunc(21);")
+//	})
+func (r *EventLoopRunner) Run(fn func(*goja.Runtime)) {
+	r.loop.Run(func(vm *goja.Runtime) {
+		r.setupVM(vm)
+		fn(vm)
+	})
+}
+
+// RunAsync executes JavaScript code and waits for all promises and timers to complete.
+// Returns the result of the last expression evaluated.
+//
+// This method blocks until all asynchronous operations (promises, timeouts, intervals)
+// have completed or an error occurs.
+//
+// Example:
+//
+//	result, err := runner.RunAsync(`
+//	    async function delay(ms) {
+//	        return new Promise(resolve => setTimeout(resolve, ms));
+//	    }
+//
+//	    async function main() {
+//	        await delay(100);
+//	        return "completed";
+//	    }
+//
+//	    main();
+//	`)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	fmt.Println(jsrunner.ExportString(result)) // "completed"
+func (r *EventLoopRunner) RunAsync(code string) (goja.Value, error) {
+	var result goja.Value
+	var runErr error
+
+	r.loop.Run(func(vm *goja.Runtime) {
+		r.setupVM(vm)
+		result, runErr = vm.RunString(code)
+	})
+
+	return result, runErr
+}
+
+// RunAsyncWithTimeout executes JavaScript code with a timeout.
+// If the code doesn't complete within the specified duration, an error is returned.
+//
+// Example:
+//
+//	result, err := runner.RunAsyncWithTimeout(`
+//	    new Promise(resolve => setTimeout(() => resolve("done"), 100))
+//	`, 5*time.Second)
+func (r *EventLoopRunner) RunAsyncWithTimeout(code string, timeout time.Duration) (goja.Value, error) {
+	var result goja.Value
+	var runErr error
+	done := make(chan struct{})
+
+	go func() {
+		r.loop.Run(func(vm *goja.Runtime) {
+			r.setupVM(vm)
+			result, runErr = vm.RunString(code)
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return result, runErr
+	case <-time.After(timeout):
+		r.loop.StopNoWait()
+		return nil, fmt.Errorf("execution timed out after %v", timeout)
+	}
+}
+
+// AwaitPromise executes JavaScript code that returns a promise and waits for it to resolve.
+// The resolved value is returned. If the promise rejects, an error is returned.
+//
+// Note: The event loop must be started with Start() before calling this method,
+// and must NOT be started with Run() (which is blocking).
+//
+// Example:
+//
+//	runner.Start()
+//	defer runner.Stop()
+//	result, err := runner.AwaitPromise(`
+//	    fetch("https://api.example.com/data")
+//	        .then(response => response.json())
+//	`)
+func (r *EventLoopRunner) AwaitPromise(code string) (interface{}, error) {
+	var resolvedValue interface{}
+	var promiseErr error
+	done := make(chan struct{})
+
+	r.loop.RunOnLoop(func(vm *goja.Runtime) {
+		r.setupVM(vm)
+
+		// Wrap the code to capture the promise result
+		wrappedCode := fmt.Sprintf(`
+			(function() {
+				var __result = { value: undefined, error: undefined, done: false };
+				var __promise = %s;
+				if (__promise && typeof __promise.then === 'function') {
+					__promise.then(function(v) {
+						__result.value = v;
+						__result.done = true;
+					}).catch(function(e) {
+						__result.error = e;
+						__result.done = true;
+					});
+				} else {
+					__result.value = __promise;
+					__result.done = true;
+				}
+				return __result;
+			})()
+		`, code)
+
+		result, err := vm.RunString(wrappedCode)
+		if err != nil {
+			promiseErr = err
+			close(done)
+			return
+		}
+
+		obj := result.ToObject(vm)
+
+		// Set up a check function that will be called after the event loop processes
+		var checkResult func()
+		checkResult = func() {
+			doneVal := obj.Get("done")
+			if doneVal.ToBoolean() {
+				errorVal := obj.Get("error")
+				if !goja.IsUndefined(errorVal) && !goja.IsNull(errorVal) {
+					promiseErr = fmt.Errorf("promise rejected: %v", errorVal.Export())
+				} else {
+					valueVal := obj.Get("value")
+					resolvedValue = valueVal.Export()
+				}
+				close(done)
+			} else {
+				// Check again on next tick
+				r.loop.RunOnLoop(func(vm *goja.Runtime) {
+					checkResult()
+				})
+			}
+		}
+
+		// Start checking after the current execution
+		r.loop.RunOnLoop(func(vm *goja.Runtime) {
+			checkResult()
+		})
+	})
+
+	<-done
+	return resolvedValue, promiseErr
+}
+
+// SetTimeout schedules a Go function to be called after the specified duration.
+// The callback receives the goja.Runtime for JavaScript execution.
+// Returns a timer that can be used to cancel the timeout.
+//
+// Example:
+//
+//	runner.SetTimeout(func(vm *goja.Runtime) {
+//	    vm.RunString("console.log('Timer fired!')")
+//	}, 1*time.Second)
+func (r *EventLoopRunner) SetTimeout(fn func(*goja.Runtime), delay time.Duration) *eventloop.Timer {
+	return r.loop.SetTimeout(func(vm *goja.Runtime) {
+		r.setupVM(vm)
+		fn(vm)
+	}, delay)
+}
+
+// SetInterval schedules a Go function to be called repeatedly at the specified interval.
+// The callback receives the goja.Runtime for JavaScript execution.
+// Returns an interval that can be passed to ClearInterval to stop it.
+//
+// Example:
+//
+//	interval := runner.SetInterval(func(vm *goja.Runtime) {
+//	    vm.RunString("counter++")
+//	}, 100*time.Millisecond)
+//
+//	// Later, stop the interval
+//	runner.ClearInterval(interval)
+func (r *EventLoopRunner) SetInterval(fn func(*goja.Runtime), interval time.Duration) *eventloop.Interval {
+	return r.loop.SetInterval(func(vm *goja.Runtime) {
+		r.setupVM(vm)
+		fn(vm)
+	}, interval)
+}
+
+// ClearInterval cancels an Interval returned by SetInterval.
+// It is safe to call inside or outside the event loop.
+//
+// Example:
+//
+//	interval := runner.SetInterval(func(vm *goja.Runtime) {
+//	    vm.RunString("tick()")
+//	}, 100*time.Millisecond)
+//	// ... later ...
+//	runner.ClearInterval(interval)
+func (r *EventLoopRunner) ClearInterval(i *eventloop.Interval) {
+	r.loop.ClearInterval(i)
+}
+
+// ClearTimeout cancels a Timer returned by SetTimeout if it has not run yet.
+// It is safe to call inside or outside the event loop.
+//
+// Example:
+//
+//	timer := runner.SetTimeout(func(vm *goja.Runtime) {
+//	    vm.RunString("timeout()")
+//	}, 5*time.Second)
+//	// Cancel before it fires
+//	runner.ClearTimeout(timer)
+func (r *EventLoopRunner) ClearTimeout(t *eventloop.Timer) {
+	r.loop.ClearTimeout(t)
+}
+
+// RunOnLoop schedules a Go function to be executed on the next iteration of the event loop.
+// This is useful for executing code that needs to run in the context of the event loop
+// from a different goroutine.
+//
+// Example:
+//
+//	go func() {
+//	    runner.RunOnLoop(func(vm *goja.Runtime) {
+//	        vm.RunString("handleExternalEvent()")
+//	    })
+//	}()
+func (r *EventLoopRunner) RunOnLoop(fn func(*goja.Runtime)) {
+	r.loop.RunOnLoop(func(vm *goja.Runtime) {
+		r.setupVM(vm)
+		fn(vm)
+	})
+}
+
+// setupVM initializes the VM with globals and optional features.
+func (r *EventLoopRunner) setupVM(vm *goja.Runtime) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for name, value := range r.globals {
+		vm.Set(name, value)
+	}
+
+	if r.webAccessEnabled {
+		r.installFetchGlobals(vm)
+	}
+}
+
+func (r *EventLoopRunner) installFetchGlobals(vm *goja.Runtime) {
+	if r.webAccessTimeout <= 0 {
+		r.webAccessTimeout = defaultWebAccessTimeout
+	}
+	if r.httpClient == nil {
+		r.httpClient = &http.Client{Timeout: r.webAccessTimeout}
+	}
+
+	vm.Set("fetchText", func(url string) (string, error) {
+		data, err := r.fetchBytes(url)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	})
+
+	vm.Set("fetchJSON", func(url string) (interface{}, error) {
+		data, err := r.fetchBytes(url)
+		if err != nil {
+			return nil, err
+		}
+
+		var payload interface{}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return nil, err
+		}
+
+		return payload, nil
+	})
+}
+
+func (r *EventLoopRunner) fetchBytes(url string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), r.webAccessTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("fetch request failed with status %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
 }

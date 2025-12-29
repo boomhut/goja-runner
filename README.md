@@ -11,6 +11,8 @@ A reusable Go package for executing JavaScript code using the [goja](https://git
 - Set global variables in the JavaScript environment
 - Export JavaScript results to Go types
 - Reuse the same runtime for multiple executions (performance optimization)
+- **Event loop with Promise/async-await support** via `EventLoopRunner`
+- Built-in `setTimeout`, `setInterval`, and `setImmediate` support
 
 ## Installation
 
@@ -246,6 +248,139 @@ fmt.Printf("got %#v\n", jsrunner.Export(jsonResult))
 
 `fetchText` returns the response body as a string while `fetchJSON` unmarshals JSON into Go values. Because the helpers run inside Go, you retain control over headers, retries, and timeouts even when the script requests external endpoints.
 
+### Event Loop and Promises
+
+For JavaScript code that uses Promises, async/await, `setTimeout`, `setInterval`, or `setImmediate`, use `EventLoopRunner`. This runner wraps the goja runtime with a proper event loop that processes asynchronous callbacks.
+
+#### Basic Promise Example
+
+```go
+import (
+    "fmt"
+    "log"
+
+    jsrunner "github.com/boomhut/goja-runner"
+)
+
+func main() {
+    runner := jsrunner.NewEventLoopRunner()
+    
+    // Start the event loop in the background
+    runner.Start()
+    defer runner.Stop()
+    
+    // Await a promise
+    result, err := runner.AwaitPromise(`
+        new Promise(function(resolve) {
+            setTimeout(function() {
+                resolve("Hello from a Promise!");
+            }, 100);
+        })
+    `)
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    fmt.Println(result) // Output: Hello from a Promise!
+}
+```
+
+#### Async/Await Example
+
+```go
+runner := jsrunner.NewEventLoopRunner()
+runner.Start()
+defer runner.Stop()
+
+result, err := runner.AwaitPromise(`
+    (async function() {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        const x = 10;
+        await new Promise(resolve => setTimeout(resolve, 50));
+        const y = 20;
+        return x + y;
+    })()
+`)
+fmt.Println(result) // Output: 30
+```
+
+#### Promise Chains
+
+```go
+runner := jsrunner.NewEventLoopRunner()
+runner.Start()
+defer runner.Stop()
+
+result, err := runner.AwaitPromise(`
+    Promise.resolve(5)
+        .then(x => x * 2)
+        .then(x => x + 3)
+        .then(x => "Result: " + x)
+`)
+fmt.Println(result) // Output: Result: 13
+```
+
+#### Using Go Functions in Promises
+
+```go
+runner := jsrunner.NewEventLoopRunner()
+
+// Set Go functions that JavaScript can call
+runner.SetGlobal("processData", func(data string) string {
+    return "Processed: " + data
+})
+
+runner.Start()
+defer runner.Stop()
+
+result, err := runner.AwaitPromise(`
+    Promise.resolve("test data")
+        .then(data => processData(data))
+`)
+fmt.Println(result) // Output: Processed: test data
+```
+
+#### Scheduling Callbacks from Go
+
+```go
+runner := jsrunner.NewEventLoopRunner()
+runner.Start()
+defer runner.Stop()
+
+// Schedule a timeout from Go
+runner.SetTimeout(func(vm *goja.Runtime) {
+    vm.RunString(`console.log("Timeout fired!")`)
+}, 100*time.Millisecond)
+
+// Schedule a repeating interval from Go
+interval := runner.SetInterval(func(vm *goja.Runtime) {
+    vm.RunString(`console.log("Interval tick")`)
+}, 50*time.Millisecond)
+
+time.Sleep(200 * time.Millisecond)
+runner.ClearInterval(interval)
+```
+
+#### Direct VM Access
+
+For more control, use `Run` to execute code with direct access to the goja runtime:
+
+```go
+runner := jsrunner.NewEventLoopRunner()
+
+runner.Run(func(vm *goja.Runtime) {
+    vm.Set("counter", 0)
+    vm.RunString(`
+        function increment() {
+            counter++;
+            return counter;
+        }
+    `)
+    result, _ := vm.RunString("increment()")
+    fmt.Println(result.ToInteger()) // Output: 1
+})
+```
+
 ### ReactApp Helper (SSR + Hydration)
 
 `ReactApp` bundles a React server entry and matching client entry with [esbuild](https://pkg.go.dev/github.com/evanw/esbuild/pkg/api), injects any required polyfills, and exposes helpers for rendering props on the server and serving the browser bundle.
@@ -418,6 +553,53 @@ Evaluates a JavaScript expression and returns the result.
 
 #### `GetVM() *goja.Runtime`
 Returns the underlying goja.Runtime for advanced usage.
+
+### EventLoopRunner
+
+#### `NewEventLoopRunner(opts ...Option) *EventLoopRunner`
+Creates a new event loop runner with support for Promises, async/await, setTimeout, setInterval, and setImmediate.
+
+#### `NewEventLoopRunnerWithGlobals(globals map[string]interface{}, opts ...Option) *EventLoopRunner`
+Creates a new event loop runner with predefined global variables.
+
+#### `Start()`
+Starts the event loop in the background. Must be called before using `AwaitPromise`, `SetTimeout`, or `SetInterval`.
+
+#### `Stop()`
+Stops the event loop and waits for all pending callbacks to complete.
+
+#### `StopNoWait()`
+Stops the event loop immediately without waiting for pending callbacks.
+
+#### `SetGlobal(name string, value interface{})`
+Sets a global variable (thread-safe).
+
+#### `Run(fn func(*goja.Runtime))`
+Executes code synchronously with direct access to the goja runtime.
+
+#### `RunAsync(code string) (goja.Value, error)`
+Executes JavaScript code and waits for all promises and timers to complete.
+
+#### `RunAsyncWithTimeout(code string, timeout time.Duration) (goja.Value, error)`
+Executes JavaScript code with a timeout.
+
+#### `AwaitPromise(code string) (interface{}, error)`
+Executes JavaScript code that returns a promise and waits for it to resolve. Returns the resolved value or an error if the promise rejects.
+
+#### `SetTimeout(fn func(*goja.Runtime), delay time.Duration) *eventloop.Timer`
+Schedules a Go function to be called after the specified delay.
+
+#### `SetInterval(fn func(*goja.Runtime), interval time.Duration) *eventloop.Interval`
+Schedules a Go function to be called repeatedly at the specified interval.
+
+#### `ClearTimeout(t *eventloop.Timer)`
+Cancels a timeout before it fires.
+
+#### `ClearInterval(i *eventloop.Interval)`
+Cancels an interval.
+
+#### `RunOnLoop(fn func(*goja.Runtime))`
+Schedules a function to run on the next iteration of the event loop.
 
 ### Helper Functions
 
